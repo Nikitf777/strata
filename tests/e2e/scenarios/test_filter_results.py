@@ -47,6 +47,18 @@ def result(strata, path):
     return None
 
 
+def selected_first_result(strata):
+    """The results list's first hit, once a changed query has selected it."""
+    rows = result_rows(strata)
+    return rows[0] if rows and rows[0].has_state("selected") else None
+
+
+def result_path(strata, row):
+    """The hit's fixture-relative path, as its row renders it."""
+    labels = [label.name for label in row.find_all(role="label") if label.name]
+    return labels[-1].removeprefix(f"{strata.fixture.root}/")
+
+
 def filter_results(strata, query="match-note", count=4, directory=None):
     strata.select_entry("match-note.txt", directory)
     strata.keyboard.press("ctrl+f")
@@ -54,6 +66,17 @@ def filter_results(strata, query="match-note", count=4, directory=None):
     strata.keyboard.type_text(query)
     strata.wait(lambda: len(strata.matches()) == count, "all recursive matches")
     return field
+
+
+def select_only(strata, row):
+    """Ctrl-click down to `row` alone; a fresh query already selected its first hit."""
+    for selected in [other for other in result_rows(strata) if other.has_state("selected")]:
+        strata.pointer.click(selected, modifiers=("ctrl",))
+    strata.pointer.click(row, modifiers=("ctrl",))
+    strata.wait(
+        lambda: [other for other in result_rows(strata) if other.has_state("selected")] == [row],
+        "only the chosen result to stay selected",
+    )
 
 
 @pytest.mark.parametrize("mode", ALL_MODES)
@@ -142,7 +165,7 @@ def test_filtered_control_selection_operates_on_the_selected_group(strata, mode,
     first = result(strata, "beta/only-match.txt")
     second = result(strata, "match-note-other.md")
     assert first is not None and second is not None
-    strata.pointer.click(first, modifiers=("ctrl",))
+    select_only(strata, first)
     strata.pointer.click(second, modifiers=("ctrl",))
     strata.pointer.click(first, modifiers=("ctrl",))
     strata.wait(lambda: not first.has_state("selected"), "Ctrl-click to deselect a result")
@@ -181,10 +204,10 @@ def test_filtered_control_selection_operates_on_the_selected_group(strata, mode,
 ])
 def test_filtered_keyboard_clipboard_keeps_status_visible(strata, mode, shortcut, hints):
     filter_results(strata, query="match", count=5)
-    for path in ["beta/only-match.txt", "match-note-other.md"]:
-        row = result(strata, path)
-        assert row is not None
-        strata.pointer.click(row, modifiers=("ctrl",))
+    rows = [result(strata, path) for path in ["beta/only-match.txt", "match-note-other.md"]]
+    assert all(row is not None for row in rows)
+    select_only(strata, rows[0])
+    strata.pointer.click(rows[1], modifiers=("ctrl",))
     strata.keyboard.press(shortcut)
     strata.wait(
         lambda: strata.window.find(role="label", name="Files on clipboard"),
@@ -371,10 +394,16 @@ def test_space_completes_a_composition_instead_of_previewing_the_selected_result
 
 
 @pytest.mark.parametrize("mode", ALL_MODES)
-def test_query_updates_retain_selection_focus_preview_and_background_menu(strata, mode):
+def test_query_updates_select_a_hit_and_retain_focus_preview_and_background_menu(strata, mode):
+    contents = {
+        "match-note.txt": "root decoy",
+        "match-note-other.md": "other match",
+        "alpha/match-note.txt": "alpha source",
+        "beta/match-note.txt": "beta source",
+    }
     field = filter_results(strata)
     row = strata.wait(lambda: result(strata, "beta/match-note.txt"), "the beta result")
-    strata.pointer.click(row, modifiers=("ctrl",))
+    select_only(strata, row)
     strata.pointer.click(field)
     strata.keyboard.press("space")
     strata.wait(lambda: strata.preview_shows("beta source"), "the selected preview")
@@ -388,10 +417,21 @@ def test_query_updates_retain_selection_focus_preview_and_background_menu(strata
         strata.keyboard.press("ctrl+a")
         strata.keyboard.type_text(query)
         strata.wait(lambda: len(strata.matches()) == count, "the updated result count")
-        assert result(strata, "beta/match-note.txt").has_state("selected")
         assert field.has_state("focused")
         assert field.text == query
-        assert strata.preview_shows("beta source")
+        if mode == "Columns":
+            # Columns keeps the selection, and the preview with it, across updates.
+            assert result(strata, "beta/match-note.txt").has_state("selected")
+            assert strata.preview_shows("beta source")
+        else:
+            # A changed query selects its first hit, and the preview follows it.
+            first = strata.wait(
+                lambda: selected_first_result(strata), "the changed query to select its first hit"
+            )
+            strata.wait(
+                lambda: strata.preview_shows(contents[result_path(strata, first)]),
+                "the preview to follow the selected hit",
+            )
     strata.keyboard.press("space")
     strata.wait(lambda: strata.preview() is None, "Space to close after updates")
     assert field.text == "match-note"
@@ -417,7 +457,7 @@ def test_filtered_rename_targets_the_nested_duplicate(strata, mode, trigger, foc
         strata.wait(strata.context_menu, "the result menu")
         strata.choose_menu_item("Rename")
     else:
-        strata.pointer.click(row, modifiers=("ctrl",))
+        select_only(strata, row)
         if focus_filter:
             strata.pointer.click(field)
         strata.keyboard.press(trigger)
@@ -513,7 +553,7 @@ def test_filtered_properties_rename_opens_the_result_inline(strata, mode):
 def test_delete_trashes_filtered_result_without_touching_hidden_selection(strata, mode):
     filter_results(strata)
     row = strata.wait(lambda: result(strata, "beta/match-note.txt"), "the beta result")
-    strata.pointer.click(row, modifiers=("ctrl",))
+    select_only(strata, row)
     strata.keyboard.press("F2")
     strata.editable_field()
     strata.keyboard.press("Escape")
@@ -608,7 +648,7 @@ def test_filtered_thumbnail_stays_rendered_across_updates_and_rename(strata, mod
     strata.wait(lambda: len(strata.matches()) == 2, "image and text results")
     row = result(strata, "beta/thumb.png")
     assert row is not None
-    strata.pointer.click(row, modifiers=("ctrl",))
+    select_only(strata, row)
     strata.pointer.click(field)
     icon = row.find(role="image")
     assert icon is not None
@@ -624,12 +664,12 @@ def test_filtered_thumbnail_stays_rendered_across_updates_and_rename(strata, mod
         strata.keyboard.press("ctrl+a")
         strata.keyboard.type_text(query)
         strata.wait(lambda: len(strata.matches()) == count, "updated image results")
-        assert row.has_state("selected")
         # AT-SPI result updates can precede the corresponding rendered frame.
         strata.wait(lambda: thumbnail_pixel() == (230, 40, 60), "the updated red thumbnail")
         assert field.has_state("focused")
 
     original = strata.fixture.path("beta/thumb.png").read_bytes()
+    select_only(strata, row)
     strata.keyboard.press("Down")
     strata.keyboard.press("F2")
     strata.editable_field()
