@@ -16,7 +16,8 @@ use gtk::prelude::*;
 use gtk::{glib, graphene};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Component, Path};
 use std::rc::{Rc, Weak};
 use std::time::Duration;
 
@@ -809,20 +810,131 @@ pub(super) fn copy_path_text(location: &Location, is_directory: bool) -> String 
 }
 
 fn shell_escape_path(path: &Path) -> String {
-    let path = path.to_string_lossy();
-    if path.contains('\n') {
-        return format!("'{}'", path.replace('\'', "'\\''"));
+    let bytes = path.as_os_str().as_bytes();
+    if let Ok(path_str) = std::str::from_utf8(bytes) {
+        if path_str.contains('\n') {
+            return format!("'{}'", path_str.replace('\'', "'\\''"));
+        }
+
+        let mut escaped = String::new();
+        for c in path_str.chars() {
+            if needs_shell_escape(c) {
+                escaped.push('\\');
+                escaped.push(c);
+            } else {
+                escaped.push(c);
+            }
+        }
+        return escaped;
     }
 
     let mut escaped = String::new();
-    for c in path.chars() {
-        if needs_shell_escape(c) {
-            escaped.push('\\');
-            escaped.push(c);
-        } else {
-            escaped.push(c);
+    let mut is_first = true;
+    let has_trailing_slash = bytes.ends_with(b"/") && bytes.len() > 1;
+
+    for component in path.components() {
+        match component {
+            Component::RootDir => {
+                escaped.push('/');
+                is_first = false;
+            }
+            Component::CurDir => {
+                if !is_first && !escaped.ends_with('/') {
+                    escaped.push('/');
+                }
+                escaped.push('.');
+                is_first = false;
+            }
+            Component::ParentDir => {
+                if !is_first && !escaped.ends_with('/') {
+                    escaped.push('/');
+                }
+                escaped.push_str("..");
+                is_first = false;
+            }
+            Component::Normal(name) => {
+                if !is_first && !escaped.ends_with('/') {
+                    escaped.push('/');
+                }
+                let component_bytes = name.as_bytes();
+                if let Ok(s) = std::str::from_utf8(component_bytes) {
+                    if s.contains('\n') {
+                        escaped.push_str(&format!("'{}'", s.replace('\'', "'\\''")));
+                    } else {
+                        for c in s.chars() {
+                            if needs_shell_escape(c) {
+                                escaped.push('\\');
+                            }
+                            escaped.push(c);
+                        }
+                    }
+                } else {
+                    escaped.push_str(&escape_ansi_c_bytes(component_bytes));
+                }
+                is_first = false;
+            }
+            Component::Prefix(_) => {}
         }
     }
+
+    if has_trailing_slash && !escaped.ends_with('/') {
+        escaped.push('/');
+    }
+    escaped
+}
+
+fn escape_ansi_c_bytes(bytes: &[u8]) -> String {
+    let mut escaped = String::from("$'");
+    let mut i = 0;
+    while i < bytes.len() {
+        match std::str::from_utf8(&bytes[i..]) {
+            Ok(s) => {
+                for c in s.chars() {
+                    match c {
+                        '\'' => escaped.push_str("\\'"),
+                        '\\' => escaped.push_str("\\\\"),
+                        '\n' => escaped.push_str("\\n"),
+                        '\r' => escaped.push_str("\\r"),
+                        '\t' => escaped.push_str("\\t"),
+                        c if c.is_control() => {
+                            use std::fmt::Write;
+                            let _ = write!(&mut escaped, "\\x{:02x}", c as u32);
+                        }
+                        _ => escaped.push(c),
+                    }
+                }
+                break;
+            }
+            Err(err) => {
+                let valid_len = err.valid_up_to();
+                if valid_len > 0 {
+                    let s = std::str::from_utf8(&bytes[i..i + valid_len]).unwrap_or_default();
+                    for c in s.chars() {
+                        match c {
+                            '\'' => escaped.push_str("\\'"),
+                            '\\' => escaped.push_str("\\\\"),
+                            '\n' => escaped.push_str("\\n"),
+                            '\r' => escaped.push_str("\\r"),
+                            '\t' => escaped.push_str("\\t"),
+                            c if c.is_control() => {
+                                use std::fmt::Write;
+                                let _ = write!(&mut escaped, "\\x{:02x}", c as u32);
+                            }
+                            _ => escaped.push(c),
+                        }
+                    }
+                    i += valid_len;
+                }
+                let error_len = err.error_len().unwrap_or(1);
+                for &b in &bytes[i..i + error_len] {
+                    use std::fmt::Write;
+                    let _ = write!(&mut escaped, "\\x{b:02x}");
+                }
+                i += error_len;
+            }
+        }
+    }
+    escaped.push('\'');
     escaped
 }
 

@@ -777,6 +777,86 @@ fn shell_escape_path_preserves_newlines_and_single_quotes() {
     );
 }
 
+#[test]
+fn shell_escape_path_escapes_non_utf8_bytes_using_ansi_c_quoting() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    assert_eq!(
+        shell_escape_path(Path::new(OsStr::from_bytes(b"/path/to/bad\xff.txt"))),
+        "/path/to/$'bad\\xff.txt'"
+    );
+    assert_eq!(
+        shell_escape_path(Path::new(OsStr::from_bytes(b"/mnt/Mass 1/bad\xff.txt"))),
+        "/mnt/Mass\\ 1/$'bad\\xff.txt'"
+    );
+    assert_eq!(
+        shell_escape_path(Path::new(OsStr::from_bytes(
+            b"/path/to/caf\xc3\xa9\xff.txt"
+        ))),
+        "/path/to/$'café\\xff.txt'"
+    );
+    assert_eq!(
+        shell_escape_path(Path::new(OsStr::from_bytes(b"bad\xff.txt"))),
+        "$'bad\\xff.txt'"
+    );
+    assert_eq!(
+        copy_path_text(
+            &Location::local(Path::new(OsStr::from_bytes(b"/path/to/bad\xff"))),
+            true
+        ),
+        "/path/to/$'bad\\xff'/"
+    );
+}
+
+#[test]
+fn copy_locations_copies_escaped_non_utf8_path_to_clipboard() {
+    crate::test_support::gtk_test(
+        "ui::browser::clipboard::tests::copy_locations_copies_escaped_non_utf8_path_to_clipboard",
+        || {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+
+            let dir = tempfile::tempdir().expect("temporary directory");
+            let file_name = OsStr::from_bytes(b"bad\xff.txt");
+            let file_path = dir.path().join(file_name);
+            std::fs::write(&file_path, b"content").expect("write bad file");
+
+            let entry = crate::test_support::operations::entry(Location::local(&file_path));
+            copy_locations(&[entry]);
+
+            let display = gtk::gdk::Display::default().expect("display");
+            let clipboard = display.clipboard();
+            let text = Rc::new(RefCell::new(None));
+            let text_clone = text.clone();
+            clipboard.read_text_async(None::<&gio::Cancellable>, move |res| {
+                if let Ok(Some(s)) = res {
+                    *text_clone.borrow_mut() = Some(s.to_string());
+                }
+            });
+            pump_main_loop_until(Duration::from_secs(1), || text.borrow().is_some());
+
+            let copied = text.borrow().clone().expect("clipboard text");
+            let expected_suffix = "$'bad\\xff.txt'";
+            assert!(
+                copied.ends_with(expected_suffix),
+                "expected {copied} to end with {expected_suffix}"
+            );
+
+            // Execute in bash to prove that pasting the copied string resolves the file on disk
+            let status = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(format!("ls -l {copied}"))
+                .status()
+                .expect("bash execution");
+            assert!(
+                status.success(),
+                "pasting {copied} into bash must access the file"
+            );
+        },
+    );
+}
+
 fn pump_main_loop_until(timeout: Duration, condition: impl Fn() -> bool) {
     let deadline = std::time::Instant::now() + timeout;
     let _waker = glib::timeout_add_local_once(timeout, || {});
