@@ -57,7 +57,16 @@ pub(super) fn general_page(
     append_date_format_option(&date_time, &manager);
 
     let performance = super::settings_group(&preferences, "PERFORMANCE");
-    append_auto_refresh_option(&performance, &manager);
+    append_preference_switch(
+        &performance,
+        &manager,
+        PreferenceSwitch {
+            title: "Watch network folders",
+            description: "Check open folders on network shares every few seconds for changes made on other computers. When off, those changes show only after a refresh.",
+            read: PreferenceManager::watch_network_folders,
+            write: PreferenceManager::set_watch_network_folders,
+        },
+    );
     append_thumbnail_workers_option(&performance, &manager);
     append_video_preview_option(&performance, &manager);
 
@@ -385,6 +394,7 @@ fn append_browsing_options(content: &gtk::Box, manager: &Rc<PreferenceManager>) 
     ] {
         append_preference_switch(&search, manager, switch);
     }
+    append_search_limit_options(&search, manager);
     append_search_exclusions_option(&search, manager);
 }
 
@@ -447,6 +457,33 @@ fn append_folder_view_options(content: &gtk::Box, manager: &Rc<PreferenceManager
         "Forget all folder settings",
         "Return every folder to the default sort and thumbnail size.",
         &forget,
+    ));
+}
+
+fn append_search_limit_options(content: &gtk::Box, manager: &Rc<PreferenceManager>) {
+    let time_limit = super::bindings::choice_menu(
+        manager,
+        "Search time limit",
+        &crate::ui::preferences::SEARCH_TIME_LIMIT_CHOICES,
+        PreferenceManager::search_time_limit,
+        PreferenceManager::set_search_time_limit,
+    );
+    content.append(&super::control_row(
+        "Search time limit",
+        "Stop indexing a search after this long. Slow or network mounts need longer to list every folder.",
+        &time_limit,
+    ));
+    let entry_limit = super::bindings::choice_menu(
+        manager,
+        "Search entry limit",
+        &crate::ui::preferences::SEARCH_ENTRY_LIMIT_CHOICES,
+        PreferenceManager::search_entry_limit,
+        PreferenceManager::set_search_entry_limit,
+    );
+    content.append(&super::control_row(
+        "Search entry limit",
+        "Stop indexing a search after this many files and folders. Higher limits use more memory.",
+        &entry_limit,
     ));
 }
 
@@ -773,17 +810,6 @@ pub(super) fn cross_volume_drop_strategy_label(strategy: CrossVolumeDropStrategy
         CrossVolumeDropStrategy::Move => "Always move",
         CrossVolumeDropStrategy::Ask => "Always ask",
     }
-}
-
-fn append_auto_refresh_option(content: &gtk::Box, manager: &Rc<PreferenceManager>) {
-    let control = super::bindings::choice_menu(
-        manager,
-        "Auto-refresh folder",
-        &crate::ui::preferences::AUTO_REFRESH_CHOICES,
-        PreferenceManager::auto_refresh_interval,
-        PreferenceManager::set_auto_refresh_interval,
-    );
-    content.append(&super::control_row("Auto-refresh folder", "Reload the current folder on a timer. Useful for network shares where file monitors miss changes.", &control));
 }
 
 fn append_video_preview_option(content: &gtk::Box, manager: &Rc<PreferenceManager>) -> gtk::Box {

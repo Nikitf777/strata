@@ -84,6 +84,14 @@ struct State {
 }
 
 impl State {
+    fn set_empty_state(&self, empty: bool) {
+        if empty {
+            self.status.set_valign(gtk::Align::Center);
+        } else {
+            self.status.set_valign(gtk::Align::Start);
+        }
+    }
+
     fn selected_entries(&self) -> Vec<FileEntry> {
         self.collection
             .selected_positions()
@@ -305,7 +313,12 @@ impl InlineSearch {
         if state.stack.visible_child_name().as_deref() != Some("search") {
             return false;
         }
-        state.collection.view.grab_focus()
+        if let Some(position) = state.collection.current_position() {
+            state.collection.restore_focus(position);
+            true
+        } else {
+            state.collection.view.grab_focus()
+        }
     }
 
     pub(super) fn selected_anchor(&self) -> Option<(gtk::Widget, FileEntry)> {
@@ -389,16 +402,32 @@ impl InlineSearch {
         if !state.session.is_active() {
             return;
         }
-        let pruned: Vec<_> = state
+        let paths = state
             .collection
             .items()
-            .iter()
-            .filter(|item| search_path_present(&item.path))
-            .cloned()
+            .into_iter()
+            .map(|item| item.path)
             .collect();
-        if pruned.len() != state.collection.sorted.n_items() as usize {
-            update_results(state, pruned, state.recursive.get());
-        }
+        let weak = Rc::downgrade(state);
+        state.session.prune_missing(paths, move |gone| {
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
+            let pruned: Vec<_> = state
+                .collection
+                .items()
+                .into_iter()
+                .filter(|item| !gone.contains(&item.path))
+                .collect();
+            if pruned.len() != state.collection.sorted.n_items() as usize {
+                if pruned.is_empty() {
+                    state.status.set_text(&crate::i18n::tr("No matching files"));
+                    state.set_empty_state(true);
+                    state.status.set_visible(true);
+                }
+                update_results(&state, pruned, state.recursive.get());
+            }
+        });
     }
 
     pub(in crate::ui) fn set_icons_max_columns(&self, max_columns: u32) {
@@ -539,6 +568,7 @@ fn show_directory_listing(state: &State) {
     state.updating.set(true);
     state.collection.clear();
     state.rendered_query.borrow_mut().clear();
+    state.set_empty_state(false);
     state.stack.set_visible_child_name("files");
     state.updating.set(false);
     state.emit_selection_changed();
@@ -612,14 +642,14 @@ pub(super) fn wrap(
     } = options;
     let stack = gtk::Stack::builder().hexpand(true).vexpand(true).build();
     stack.add_named(content, Some("files"));
-    let results = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    let status = gtk::Label::new(None);
-    status.add_css_class("status-message");
-    status.set_wrap(true);
-    status.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-    status.set_justify(gtk::Justification::Center);
-    results.append(&status);
     let recursive = Rc::new(Cell::new(false));
+    let weak_entry = entry.downgrade();
+    let focus_entry = Rc::new(move || {
+        weak_entry
+            .upgrade()
+            .filter(|entry| entry.is_mapped())
+            .is_some_and(|entry| entry.grab_focus_without_selecting())
+    });
     let (collection, scroll, overlay) = build_collection(
         presentation,
         recursive.clone(),
@@ -629,10 +659,20 @@ pub(super) fn wrap(
             activate: activate.clone(),
             single_click,
             focus_items,
+            focus_entry,
         },
     );
-    results.append(&overlay);
-    stack.add_named(&results, Some("search"));
+    let status = gtk::Label::new(None);
+    status.add_css_class("status-message");
+    status.set_wrap(true);
+    status.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    status.set_justify(gtk::Justification::Center);
+    status.set_halign(gtk::Align::Center);
+    status.set_valign(gtk::Align::Center);
+    status.set_can_target(false);
+    overlay.add_overlay(&status);
+    overlay.set_measure_overlay(&status, false);
+    stack.add_named(&overlay, Some("search"));
     let state = Rc::new(State {
         entry: entry.downgrade(),
         stack: stack.clone(),
@@ -749,11 +789,12 @@ pub(super) fn wrap(
             }
             if state.collection.sorted.n_items() == 0 {
                 state.status.set_text(&crate::i18n::tr("Searching…"));
+                state.set_empty_state(true);
                 state.status.set_visible(true);
             }
-            let show_hidden = weak_browser
-                .upgrade()
-                .is_some_and(|browser| browser.preferences().show_hidden);
+            let (show_hidden, within) = weak_browser.upgrade().map_or((false, None), |browser| {
+                (browser.preferences().show_hidden, browser.confined_to())
+            });
             let weak = Rc::downgrade(state);
             let browser = weak_browser.clone();
             let search_root = root.clone();
@@ -763,6 +804,7 @@ pub(super) fn wrap(
                     show_hidden,
                     scope,
                     refused: Default::default(),
+                    within,
                 },
                 query,
                 restart,
@@ -776,10 +818,13 @@ pub(super) fn wrap(
                         &batch.query,
                         batch.items,
                         batch.has_more,
+                        batch.candidates,
                     );
+                    let is_empty = items.is_empty();
+                    state.set_empty_state(is_empty);
                     state
                         .status
-                        .set_visible(items.is_empty() || batch.coverage.is_partial());
+                        .set_visible(is_empty || batch.coverage.is_partial());
                     state.status.set_text(&if batch.coverage.is_partial() {
                         batch.coverage.message()
                     } else if batch.indexing {
@@ -841,14 +886,11 @@ pub(super) fn eligible_results(
     query: &str,
     items: Vec<SearchItem>,
     has_more: bool,
+    candidates: usize,
 ) -> Vec<SearchItem> {
-    let candidates = items.len();
     let items = items
         .into_iter()
-        .filter(|item| {
-            browser.allows_entry(&super::browser::search_result_entry(item))
-                && search_path_present(&item.path)
-        })
+        .filter(|item| browser.allows_entry(&super::browser::search_result_entry(item)))
         .take(crate::services::SEARCH_RESULT_LIMIT)
         .collect::<Vec<_>>();
     // Type/folder predicates run on GTK's thread, after ranking but before the display cap.
@@ -857,12 +899,4 @@ pub(super) fn eligible_results(
         handle.query_candidates(query, candidates.saturating_mul(2));
     }
     items
-}
-
-pub(super) fn search_path_present(path: &Path) -> bool {
-    // Preserve dangling symlinks and uncertain paths; only confirmed absence removes a hit.
-    path.symlink_metadata().map_or_else(
-        |error| error.kind() != std::io::ErrorKind::NotFound,
-        |_| true,
-    )
 }

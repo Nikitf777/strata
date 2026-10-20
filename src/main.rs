@@ -31,7 +31,8 @@ mod ui;
 mod util;
 
 use std::{
-    ffi::OsString, ops::ControlFlow, os::unix::process::CommandExt, process::Stdio, time::Duration,
+    cell::OnceCell, ffi::OsString, ops::ControlFlow, os::unix::process::CommandExt, process::Stdio,
+    time::Duration,
 };
 
 use gtk::{gio, glib, prelude::*};
@@ -80,6 +81,36 @@ fn launch_mode(arguments: &[OsString]) -> LaunchMode {
     }
 }
 
+/// `GTK_THEME` replaces GTK's theme regardless of its settings, so it is dropped
+/// before GTK starts; `ui::theme` pins the built-in theme from there on.
+const DESKTOP_THEME_OVERRIDE: &str = "GTK_THEME";
+
+fn has_desktop_theme_override() -> bool {
+    std::env::var_os(DESKTOP_THEME_OVERRIDE).is_some()
+}
+
+/// GTK reads its renderer and theme override during startup. Re-exec before
+/// initializing GTK rather than mutating the environment after libraries may
+/// have started threads. Returns only when the restart fails.
+fn restart_for_gtk_environment(arguments: &[OsString], select_cairo: bool) -> gtk::glib::ExitCode {
+    let Ok(executable) = std::env::current_exe() else {
+        eprintln!("Unable to locate Strata to restart it");
+        return gtk::glib::ExitCode::FAILURE;
+    };
+    let mut command = std::process::Command::new(executable);
+    command
+        .args(&arguments[1..])
+        .env_remove(DESKTOP_THEME_OVERRIDE);
+    if select_cairo {
+        command
+            .env("GSK_RENDERER", "cairo")
+            .env(CAIRO_SELECTED_BY_STRATA, "1");
+    }
+    let error = command.exec();
+    eprintln!("Unable to restart Strata: {error}");
+    gtk::glib::ExitCode::FAILURE
+}
+
 fn should_select_cairo(
     supplied_renderer: Option<&std::ffi::OsStr>,
     choice: ui::preferences::InterfaceRenderer,
@@ -91,7 +122,7 @@ fn version_line() -> String {
     format!(
         "{} {}",
         env!("CARGO_PKG_NAME"),
-        build_info::installed_version()
+        build_info::displayed_version()
     )
 }
 
@@ -158,7 +189,15 @@ fn main() -> gtk::glib::ExitCode {
             return gtk::glib::ExitCode::SUCCESS;
         }
         LaunchMode::Portal => {
+            if has_desktop_theme_override() {
+                return restart_for_gtk_environment(&arguments, false);
+            }
             restart_with_local_vfs_if_gvfs_is_unresponsive();
+            let _volumes = gio::VolumeMonitor::get();
+            adapters::mount_watch::start();
+            ui::read_install_facts();
+            leave_launch_folder();
+            util::ui_thread::mark();
             return portal::run();
         }
         LaunchMode::InstallPortal => return finish_portal_setup(portal_setup::install()),
@@ -183,23 +222,12 @@ fn main() -> gtk::glib::ExitCode {
     install_application_identity();
     metrics::initialize();
     logging::initialize();
-    if should_select_cairo(
+    let select_cairo = should_select_cairo(
         std::env::var_os("GSK_RENDERER").as_deref(),
         ui::preferences::PreferenceManager::shared().interface_renderer(),
-    ) {
-        // GTK selects its renderer during startup. Re-exec before initializing GTK
-        // rather than mutating the environment after libraries may start threads.
-        let Ok(executable) = std::env::current_exe() else {
-            eprintln!("Unable to locate Strata to select the Cairo renderer");
-            return gtk::glib::ExitCode::FAILURE;
-        };
-        let error = std::process::Command::new(executable)
-            .args(&arguments[1..])
-            .env("GSK_RENDERER", "cairo")
-            .env(CAIRO_SELECTED_BY_STRATA, "1")
-            .exec();
-        eprintln!("Unable to restart Strata with Cairo renderer: {error}");
-        return gtk::glib::ExitCode::FAILURE;
+    );
+    if select_cairo || has_desktop_theme_override() {
+        return restart_for_gtk_environment(&arguments, select_cairo);
     }
 
     if let Err(error) = portal_setup::refresh_stale_portal() {
@@ -214,7 +242,6 @@ fn main() -> gtk::glib::ExitCode {
         elapsed_ms = launched.elapsed().as_millis() as u64,
         "startup gvfs probe finished"
     );
-
     let assets_started = std::time::Instant::now();
     if let Err(error) = assets::prepare() {
         eprintln!("Unable to prepare bundled assets: {error}");
@@ -239,10 +266,30 @@ fn main() -> gtk::glib::ExitCode {
         Some("DEVICE"),
     );
     application.connect_handle_local_options(|_, _| ControlFlow::Continue(()));
+    application.connect_startup(move |_| {
+        VOLUME_MONITOR.with(|monitor| {
+            monitor.get_or_init(gio::VolumeMonitor::get);
+        });
+        tracing::debug!(
+            elapsed_ms = launched.elapsed().as_millis() as u64,
+            "startup volume monitor ready"
+        );
+    });
+    application.connect_startup(|application| {
+        if application
+            .flags()
+            .contains(gio::ApplicationFlags::IS_SERVICE)
+        {
+            leave_launch_folder();
+        }
+    });
     application.connect_startup(|_| install_x11_program_class());
     application.connect_startup(export_file_manager_interface);
     application.connect_startup(|_application| ui::schedule_rollback_cleanup());
-    application.connect_shutdown(|_| ui::preferences::flush_pending_folder_views());
+    application.connect_shutdown(|_| {
+        ui::preferences::flush_pending_folder_views();
+        storage::writer::flush_at_exit();
+    });
     application.connect_activate(|application| {
         if let Err(error) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             ui::present(application);
@@ -273,7 +320,15 @@ fn main() -> gtk::glib::ExitCode {
             }
         }
     });
+    adapters::mount_watch::start();
+    ui::read_install_facts();
+    util::ui_thread::mark();
+    util::ui_thread::stalls::start();
     application.run()
+}
+
+thread_local! {
+    static VOLUME_MONITOR: OnceCell<gio::VolumeMonitor> = const { OnceCell::new() };
 }
 
 const UNLOCK_VOLUME_WITH_FILES: &str = "cannot combine --unlock-volume with file arguments";
@@ -322,6 +377,7 @@ fn handle_command_line(
         .skip(1)
         .map(|argument| cmdline.create_file_for_arg(argument))
         .collect();
+    leave_launch_folder();
     let is_service = application
         .flags()
         .contains(gio::ApplicationFlags::IS_SERVICE);
@@ -348,6 +404,12 @@ fn handle_command_line(
             eprintln!("{message}");
             glib::ExitCode::FAILURE
         }
+    }
+}
+
+fn leave_launch_folder() {
+    if let Err(error) = std::env::set_current_dir("/") {
+        tracing::warn!(%error, "unable to leave the launch folder");
     }
 }
 

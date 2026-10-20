@@ -32,7 +32,7 @@ fn renderer_outputs_are_never_read_through_symlinks() {
     let dir = tempfile::tempdir().expect("scratch directory");
     let real = dir.path().join("host-file");
     fs::write(&real, b"2 5").expect("host file");
-    for name in ["result.png", "result.meta"] {
+    for name in ["result.png", "result.meta", "result.model"] {
         let link = dir.path().join(name);
         std::os::unix::fs::symlink(&real, &link).expect("planted symlink");
         assert!(super::read_private_output(&link, 256).is_err());
@@ -166,10 +166,14 @@ fn sandbox_command_starts_absolute_bubblewrap() {
         .join(" ");
     assert!(joined.contains("--unshare-all"));
     assert!(joined.contains("--clearenv"));
+    assert!(joined.contains("--info-fd 2"), "{joined}");
     let arguments: Vec<_> = command.get_args().collect();
-    let path = option_env!("STRATA_SANDBOX_PATH").unwrap_or("/usr/bin");
-    let root = option_env!("STRATA_SANDBOX_ROOT").unwrap_or("/usr");
-    let prlimit = option_env!("STRATA_SANDBOX_PRLIMIT").unwrap_or("/usr/bin/prlimit");
+    let runtime = super::runtime::current();
+    let (path, root, prlimit) = (
+        runtime.path.as_str(),
+        runtime.root.as_str(),
+        runtime.prlimit.as_str(),
+    );
     assert!(
         arguments
             .windows(3)
@@ -185,7 +189,7 @@ fn sandbox_command_starts_absolute_bubblewrap() {
             .windows(3)
             .any(|args| args == ["--", prlimit, "--as=2147483648"])
     );
-    match option_env!("STRATA_SANDBOX_GDK_PIXBUF_MODULE_FILE") {
+    match &runtime.gdk_pixbuf_module_file {
         Some(loaders) => assert!(
             arguments
                 .windows(3)
@@ -329,6 +333,82 @@ fn metadata_probe_retains_software_sandbox_limits_and_narrow_runtime_access() {
 }
 
 #[test]
+fn non_media_helpers_expose_gl_dispatch_links_without_the_whole_directory() {
+    let command = sandbox_command(
+        Path::new("/usr/bin/bwrap"),
+        Path::new("/tmp/strata"),
+        Path::new("/home/alice/Pictures/photo.jpg"),
+        Path::new("/tmp/private-output"),
+        ParseOperation::ThumbnailImage,
+        256,
+        MediaPreviewBackend::Software,
+        &[],
+    );
+    let arguments: Vec<_> = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy())
+        .collect();
+    assert!(
+        !arguments
+            .iter()
+            .any(|argument| argument == "/etc/alternatives")
+    );
+    let mut exposed: Vec<_> = arguments
+        .windows(3)
+        .filter(|bind| bind[0] == "--ro-bind-try" && bind[1].starts_with("/etc/alternatives/glx--"))
+        .map(|bind| format!("{} {}", bind[1], bind[2]))
+        .collect();
+    let mut expected = Vec::new();
+    for architecture in ["x86_64-linux-gnu", "aarch64-linux-gnu"] {
+        for library in [
+            "libGL.so.1",
+            "libEGL.so.1",
+            "libGLESv2.so.2",
+            "libGLESv1_CM.so.1",
+            "libGL.so",
+            "libEGL.so",
+            "libGLESv2.so",
+            "libGLESv1_CM.so",
+            "libGLX_indirect.so.0",
+        ] {
+            let path = format!("/etc/alternatives/glx--{library}-{architecture}");
+            expected.push(format!("{path} {path}"));
+        }
+    }
+    exposed.sort();
+    expected.sort();
+    assert_eq!(exposed, expected);
+}
+
+#[test]
+fn image_sandboxes_resolve_debian_imagemagick_alternatives() {
+    let command = sandbox_command(
+        Path::new("/usr/bin/bwrap"),
+        Path::new("/tmp/strata"),
+        Path::new("/home/alice/Pictures/untrusted.heic"),
+        Path::new("/tmp/private-output"),
+        ParseOperation::PreviewImage,
+        0,
+        MediaPreviewBackend::Software,
+        &[],
+    );
+    let arguments: Vec<_> = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy())
+        .collect();
+    let joined = arguments.join(" ");
+    for tool in ["magick", "convert"] {
+        let path = format!("/etc/alternatives/{tool}");
+        assert!(joined.contains(&format!("--ro-bind-try {path} {path}")));
+    }
+    assert!(
+        !arguments
+            .iter()
+            .any(|argument| argument == "/etc/alternatives")
+    );
+}
+
+#[test]
 fn media_previews_use_bounded_streaming_instead_of_driver_wide_resource_limits() {
     let operation = MEDIA_PREVIEW.clone();
     let command = sandbox_command(
@@ -347,9 +427,11 @@ fn media_previews_use_bounded_streaming_instead_of_driver_wide_resource_limits()
         .map(|argument| argument.to_string_lossy())
         .collect::<Vec<_>>()
         .join(" ");
-    assert!(!command.get_args().any(|argument| {
-        argument == option_env!("STRATA_SANDBOX_PRLIMIT").unwrap_or("/usr/bin/prlimit")
-    }));
+    assert!(
+        !command
+            .get_args()
+            .any(|argument| argument == super::runtime::current().prlimit.as_str())
+    );
     assert!(!joined.contains("--as="));
     assert!(!joined.contains("--cpu="));
     assert!(!joined.contains("--fsize="));
@@ -1044,4 +1126,44 @@ fn archive_operation_debug_redacts_the_password() {
         rendered.contains("password: None"),
         "an absent password must stay distinguishable, got {rendered:?}"
     );
+}
+
+fn sandbox_whose_init_outlives_it(ends: &str) -> Command {
+    let script = format!(
+        r#"setsid sleep 0.4 </dev/null >/dev/null 2>&1 &
+init=$!
+until [ "$(cut -d' ' -f6 /proc/$init/stat 2>/dev/null)" = "$init" ]; do :; done
+printf '{{\n    "child-pid": %s,\n    "net-namespace": 1\n}}\n' "$init" >&2
+{ends}"#
+    );
+    let mut command = Command::new("sh");
+    command.args(["-c", &script]);
+    command
+}
+
+#[test]
+fn a_sandbox_is_waited_for_until_the_init_of_its_namespace_has_exited() {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    for (row, ends, cancelled) in [
+        ("an exit of its own", "exec 2>&-; exit 0", false),
+        ("a kill", "exec 2>&-; wait", true),
+    ] {
+        let mut renderer =
+            spawn_renderer(&mut sandbox_whose_init_outlives_it(ends)).expect("start the sandbox");
+        let init = renderer.init.take().expect("the reported namespace init");
+        let watched = rustix::io::dup(&init).expect("watch the namespace init");
+        renderer.init = Some(init);
+        let cancellation = Cancellation::default();
+        if cancelled {
+            cancellation.cancel();
+        }
+        let started = Instant::now();
+
+        let _ = wait_for_renderer(&mut renderer, &cancellation, Duration::from_secs(5));
+
+        let mut fds = [PollFd::new(&watched, PollFlags::IN)];
+        let gone = poll(&mut fds, Some(&Timespec::default())).expect("poll the namespace init");
+        assert_eq!(gone, 1, "{row}: the namespace init still runs");
+        assert!(started.elapsed() < Duration::from_secs(2), "{row}");
+    }
 }

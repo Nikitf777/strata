@@ -146,6 +146,18 @@ const TARGETS: &[Target] = &[
         aliases: "launch files quick preview",
     },
     Target {
+        id: "search-time-limit",
+        page: "general",
+        title: "Search time limit",
+        aliases: "search filter indexing walk timeout seconds minutes slow network mount partial results",
+    },
+    Target {
+        id: "search-entry-limit",
+        page: "general",
+        title: "Search entry limit",
+        aliases: "search filter indexing walk maximum files folders entries memory partial results",
+    },
+    Target {
         id: "search-exclusions",
         page: "general",
         title: "Global search exclusions",
@@ -176,10 +188,10 @@ const TARGETS: &[Target] = &[
         aliases: "file transfers drag drop destination navigate reveal copy move",
     },
     Target {
-        id: "refresh",
+        id: "watch-network-folders",
         page: "general",
-        title: "Auto-refresh folder",
-        aliases: "performance timer reload network share monitors",
+        title: "Watch network folders",
+        aliases: "performance network share nfs smb sftp remote changes check refresh reload monitor",
     },
     Target {
         id: "video",
@@ -242,6 +254,12 @@ const TARGETS: &[Target] = &[
         aliases: "appearance colors custom themes add edit light dark",
     },
     Target {
+        id: "interface-font",
+        page: "theme",
+        title: "Interface font",
+        aliases: "appearance font typeface family typography",
+    },
+    Target {
         id: "text",
         page: "theme",
         title: "Text size",
@@ -252,6 +270,18 @@ const TARGETS: &[Target] = &[
         page: "general",
         title: "Modified date format",
         aliases: "date time format relative iso 8601 long absolute modified timestamp clock appearance",
+    },
+    Target {
+        id: "roundness",
+        page: "theme",
+        title: "Corner roundness",
+        aliases: "appearance corners radius rounded square shape borders",
+    },
+    Target {
+        id: "show-thumbnails",
+        page: "theme",
+        title: "Show thumbnails",
+        aliases: "appearance images pictures photos videos documents thumbnails icons previews disable",
     },
     Target {
         id: "file-icon-colors",
@@ -300,6 +330,18 @@ const TARGETS: &[Target] = &[
         page: "updates",
         title: "Release notes",
         aliases: "what new changes changelog",
+    },
+    Target {
+        id: "integrations",
+        page: "integrations",
+        title: "Integrations",
+        aliases: "add-ons addons plugins extensions providers catalog install kde connect localsend nextcloud dropbox cloud devices phone",
+    },
+    Target {
+        id: "diagnostics",
+        page: "diagnostics",
+        title: "Run diagnostics",
+        aliases: "troubleshoot troubleshooting problems health check dependencies missing packages report bug sandbox bubblewrap ffmpeg gstreamer gvfs sftp smb udisks portal",
     },
     Target {
         id: "version",

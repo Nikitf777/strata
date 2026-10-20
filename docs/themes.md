@@ -2,7 +2,7 @@
 
 Strata styles the interface with nine semantic color tokens. Bundled themes are the fallback on any Linux desktop; Azure Glow is the default. Settings presents all 95 bundled themes in one searchable, light/dark-filterable scrolling catalog.
 
-Tinted Base16 entries map colors to Strata tokens as follows: `base00` to background, `base01` to surface, `base05` to text, `base0D` to accent, `base08` to danger, `base02` to muted and highlight, `base03` to border, and `base04` to dim text. A few bundled entries override the mapped foreground values so body text stays readable: text is at least 4.5:1 on background and 3:1 on surface. Where the upstream dim text is also unreadable, it is adjusted to stay legible while remaining dimmer than text. The catalog comments each override next to the value. Source revision and licensing details are recorded in [`THIRD_PARTY_LICENSES.md`](../THIRD_PARTY_LICENSES.md).
+Tinted Base16 entries map colors to Strata tokens as follows: `base00` to background, `base01` to surface, `base05` to text, `base0D` to accent, `base08` to danger, `base02` to muted and highlight, `base03` to border, and `base04` to dim text. A few bundled entries override the mapped foreground values so body text stays readable: text is at least 4.5:1 on background and 3:1 on surface; the catalog comments each override next to the value. Where the upstream dim text is also unreadable, loading the bundled theme lifts it to the same floors, stopping as soon as they are met so it stays dimmer than text. Source revision and licensing details are recorded in [`THIRD_PARTY_LICENSES.md`](../THIRD_PARTY_LICENSES.md).
 
 ## GTK CSS precedence
 
@@ -11,10 +11,56 @@ Strata defines its named colors as `@strata_bg`, `@strata_surface`,
 `@theme_*` names; user stylesheets referencing those names must be updated.
 Custom theme TOML keys are unchanged.
 
-Strata's token provider takes precedence over GTK theme defaults, but user
-`~/.config/gtk-4.0/gtk.css` retains GTK's higher user priority. The namespace
-prevents accidental collisions with other stylesheets' `@theme_*` colors;
-it does not override deliberate user selectors or `@strata_*` definitions.
+Strata isolates its appearance from desktop GTK styling:
+
+- The GTK theme setting is pinned to an empty theme bundled with Strata. A
+  desktop theme selected through the settings portal, `settings.ini`, or
+  `GTK_THEME` is ignored; `GTK_THEME` is dropped from the environment before
+  GTK starts.
+- The built-in theme's light or dark variant follows the active Strata theme's
+  background, not the desktop color scheme, and the high-contrast variant is
+  never used.
+- Above GTK's user priority, Strata unsets every property and restates GTK's
+  built-in `Default` theme before its own stylesheets, so
+  `~/.config/gtk-4.0/gtk.css` cannot change any property of Strata's widgets.
+
+The `@strata_*` namespace prevents accidental collisions with other
+stylesheets' `@theme_*` colors; it does not stop deliberate `@strata_*`
+redefinitions in a user stylesheet.
+
+## User stylesheet
+
+To restyle Strata itself, create an optional stylesheet at:
+
+```text
+~/.config/strata/style.css
+```
+
+It is loaded above every stylesheet Strata ships, including the active theme,
+so its rules win over Strata's own. The `@strata_*` colors of the active theme
+are available, which keeps overrides in step with theme changes:
+
+```css
+/* A floating, rounded sidebar */
+.sidebar-shell {
+    margin: 8px 0 8px 8px;
+    border-right: none;
+    border-radius: 14px;
+    background: alpha(@strata_surface, 0.6);
+}
+
+/* Let the card show through the sidebar's own opaque layers */
+.sidebar-shell .sidebar-scroll,
+.sidebar-shell .sidebar-scroll viewport,
+.sidebar-shell .sidebar {
+    background: transparent;
+}
+```
+
+Strata re-reads the file when it changes, so edits apply to open windows
+without a restart; deleting it restores the default appearance. Rules GTK
+cannot parse are skipped and logged as warnings. Class names are not a stable
+interface and may change between releases.
 
 ## Custom theme files
 
@@ -39,11 +85,19 @@ border = "#315b75"
 dim_text = "#6f8da3"
 ```
 
-Strata discovers valid `.toml` files in this directory on startup and displays them under **Your themes**. If a custom filename matches a bundled theme ID, the custom theme replaces that bundled entry so saved preferences and selection always use the user’s palette. Colors load as `#rrggbb`, or `#rrggbbaa` when translucent, so GTK-only forms such as 9-digit hex still apply; the file is not rewritten. Interface icons ignore the alpha.
+Strata discovers valid `.toml` files in this directory on startup, re-reads them when they change (see [Live updates](#live-updates)), and displays them under **Your themes**. If a custom filename matches a bundled theme ID, the custom theme replaces that bundled entry so saved preferences and selection always use the user’s palette. Colors load as `#rrggbb`, or `#rrggbbaa` when translucent, so GTK-only forms such as 9-digit hex still apply; the file is not rewritten. Interface icons ignore the alpha.
 
 The configurator derives a new file's ID from the theme name, lowercased, keeping ASCII letters and digits and joining the rest with `-` (for example `Ocean Blue` becomes `ocean-blue.toml`). Names without ASCII letters or digits are saved as `custom-theme.toml`. The `name` field keeps the name exactly as typed, so names such as `日本語` are still shown as written.
 
 Theme files may be symlinks into a dotfiles repository. The configurator never replaces an existing theme: when the ID matches a bundled theme or a loaded custom theme, or `<theme-id>.toml` already exists, whether it loaded or not (for example an invalid file or a link to a missing or broken dotfile), the new theme is saved as the next free `<theme-id>-2.toml`, `<theme-id>-3.toml`, and so on. Saving a theme named `Dracula` therefore creates `dracula-2.toml` and leaves the bundled Dracula theme in place.
+
+## Live updates
+
+Strata watches `~/.config/strata/themes/` while it runs. When a `.toml` file changes there, the custom themes are read again; if the theme currently selected resolves to different colors, it is re-applied to every open window, including icon colors and code-preview syntax colors. No restart is needed.
+
+This makes dynamic themes work: a generator can rewrite a theme file in place, for example a [matugen](https://github.com/InioX/matugen) template that follows the wallpaper and writes `~/.config/strata/themes/matugen.toml` on every change. Select that theme once (Settings → Appearance, or `theme = "matugen"` in `settings.toml`) and open windows follow the file.
+
+Writes are debounced, so a generator touching several files in a row triggers one re-read. If a file is caught mid-write, invalid, or removed, the current appearance stays in place; the next read that produces valid colors applies them.
 
 ## Syntax colors
 
